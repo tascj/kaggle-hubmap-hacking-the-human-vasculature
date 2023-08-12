@@ -54,4 +54,4 @@ annotations = [
     if ann['id'] in valid_ann_ids
 ]
 d['annotations'] = annotations
-mmengine.dump(d, '../data/dtrain_dataset2_drop.json')
+mmengine.dump(d, '../data/dtrain_dataset2_dropdup.json')
