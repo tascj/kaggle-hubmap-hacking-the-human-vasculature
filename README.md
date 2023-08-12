@@ -1,6 +1,7 @@
 # HuBMAP - Hacking the Human Vasculature
 
-https://www.kaggle.com/competitions/hubmap-hacking-the-human-vasculature
+[Competition](https://www.kaggle.com/competitions/hubmap-hacking-the-human-vasculature)
+[Solution Write-up](https://www.kaggle.com/competitions/hubmap-hacking-the-human-vasculature/discussion/429060)
 
 ## Environment setup
 
@@ -82,3 +83,9 @@ python train.py configs/sb0.py --amp
 python train.py configs/coco/s.py --amp
 python train.py configs/s0.py --amp
 ```
+
+## Inference
+
+Check training log for best iteration and use `tools/dump_ckpt.py` to extract the best checkpoint.
+
+Inference and ensemble could be found [here](https://www.kaggle.com/code/tascj0/hubmap-2023-release?scriptVersionId=139357383).
