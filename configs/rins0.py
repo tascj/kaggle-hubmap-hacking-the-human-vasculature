@@ -104,6 +104,7 @@ train_pipeline = [
          rot90_prob=1.0,
          mask_dtype='u1',
     ),
+    dict(type='ConvertGtMasks'),
     dict(type='PackDetInputs')
 ]
 test_pipeline = [

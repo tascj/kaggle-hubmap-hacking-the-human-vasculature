@@ -10,8 +10,9 @@ from mmdet.registry import MODELS
 from mmdet.models.dense_heads import RTMDetInsHead, RTMDetInsSepBNHead
 from mmdet.models.dense_heads.rtmdet_ins_head import MaskFeatModule
 from mmdet.models.layers.transformer import inverse_sigmoid
-from mmdet.models.utils import sigmoid_geometric_mean
-from mmdet.utils import InstanceList, reduce_mean
+from mmdet.models.utils import sigmoid_geometric_mean, multi_apply
+from mmdet.structures.bbox import distance2bbox
+from mmdet.utils import InstanceList, OptInstanceList, reduce_mean
 
 
 
@@ -141,6 +142,80 @@ class RTMDetInsHeadFixes(RTMDetInsHead):
         return tuple(cls_scores), tuple(bbox_preds), tuple(
             kernel_preds), mask_feat
 
+    def loss_by_feat(self,
+                     cls_scores: List[Tensor],
+                     bbox_preds: List[Tensor],
+                     kernel_preds: List[Tensor],
+                     mask_feat: Tensor,
+                     batch_gt_instances: InstanceList,
+                     batch_img_metas: List[dict],
+                     batch_gt_instances_ignore: OptInstanceList = None):
+        num_imgs = len(batch_img_metas)
+        featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
+        assert len(featmap_sizes) == self.prior_generator.num_levels
+
+        device = cls_scores[0].device
+        anchor_list, valid_flag_list = self.get_anchors(
+            featmap_sizes, batch_img_metas, device=device)
+        flatten_cls_scores = torch.cat([
+            cls_score.permute(0, 2, 3, 1).reshape(num_imgs, -1,
+                                                  self.cls_out_channels)
+            for cls_score in cls_scores
+        ], 1)
+        flatten_kernels = torch.cat([
+            kernel_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1,
+                                                    self.num_gen_params)
+            for kernel_pred in kernel_preds
+        ], 1)
+        decoded_bboxes = []
+        for anchor, bbox_pred in zip(anchor_list[0], bbox_preds):
+            anchor = anchor.reshape(-1, 4)
+            bbox_pred = bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
+            bbox_pred = distance2bbox(anchor, bbox_pred)
+            decoded_bboxes.append(bbox_pred)
+
+        flatten_bboxes = torch.cat(decoded_bboxes, 1)
+
+        # MODIFIED: convert in data pipeline to speedup training
+        # for gt_instances in batch_gt_instances:
+        #     gt_instances.masks = gt_instances.masks.to_tensor(
+        #         dtype=torch.bool, device=device)
+
+        cls_reg_targets = self.get_targets(
+            flatten_cls_scores,
+            flatten_bboxes,
+            anchor_list,
+            valid_flag_list,
+            batch_gt_instances,
+            batch_img_metas,
+            batch_gt_instances_ignore=batch_gt_instances_ignore)
+        (anchor_list, labels_list, label_weights_list, bbox_targets_list,
+         assign_metrics_list, sampling_results_list) = cls_reg_targets
+
+        losses_cls, losses_bbox,\
+            cls_avg_factors, bbox_avg_factors = multi_apply(
+                self.loss_by_feat_single,
+                cls_scores,
+                decoded_bboxes,
+                labels_list,
+                label_weights_list,
+                bbox_targets_list,
+                assign_metrics_list,
+                self.prior_generator.strides)
+
+        cls_avg_factor = reduce_mean(sum(cls_avg_factors)).clamp_(min=1).item()
+        losses_cls = list(map(lambda x: x / cls_avg_factor, losses_cls))
+
+        bbox_avg_factor = reduce_mean(
+            sum(bbox_avg_factors)).clamp_(min=1).item()
+        losses_bbox = list(map(lambda x: x / bbox_avg_factor, losses_bbox))
+
+        loss_mask = self.loss_mask_by_feat(mask_feat, flatten_kernels,
+                                           sampling_results_list,
+                                           batch_gt_instances)
+        loss = dict(
+            loss_cls=losses_cls, loss_bbox=losses_bbox, loss_mask=loss_mask)
+        return loss
 
 
 @MODELS.register_module()
@@ -373,3 +448,79 @@ class RTMDetInsSepBNHeadFixes(RTMDetInsSepBNHead):
             kernel_preds.append(kernel_pred)
         return tuple(cls_scores), tuple(bbox_preds), tuple(
             kernel_preds), mask_feat
+    
+
+    def loss_by_feat(self,
+                     cls_scores: List[Tensor],
+                     bbox_preds: List[Tensor],
+                     kernel_preds: List[Tensor],
+                     mask_feat: Tensor,
+                     batch_gt_instances: InstanceList,
+                     batch_img_metas: List[dict],
+                     batch_gt_instances_ignore: OptInstanceList = None):
+        num_imgs = len(batch_img_metas)
+        featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
+        assert len(featmap_sizes) == self.prior_generator.num_levels
+
+        device = cls_scores[0].device
+        anchor_list, valid_flag_list = self.get_anchors(
+            featmap_sizes, batch_img_metas, device=device)
+        flatten_cls_scores = torch.cat([
+            cls_score.permute(0, 2, 3, 1).reshape(num_imgs, -1,
+                                                  self.cls_out_channels)
+            for cls_score in cls_scores
+        ], 1)
+        flatten_kernels = torch.cat([
+            kernel_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1,
+                                                    self.num_gen_params)
+            for kernel_pred in kernel_preds
+        ], 1)
+        decoded_bboxes = []
+        for anchor, bbox_pred in zip(anchor_list[0], bbox_preds):
+            anchor = anchor.reshape(-1, 4)
+            bbox_pred = bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
+            bbox_pred = distance2bbox(anchor, bbox_pred)
+            decoded_bboxes.append(bbox_pred)
+
+        flatten_bboxes = torch.cat(decoded_bboxes, 1)
+
+        # MODIFIED: convert in data pipeline to speedup training
+        # for gt_instances in batch_gt_instances:
+        #     gt_instances.masks = gt_instances.masks.to_tensor(
+        #         dtype=torch.bool, device=device)
+
+        cls_reg_targets = self.get_targets(
+            flatten_cls_scores,
+            flatten_bboxes,
+            anchor_list,
+            valid_flag_list,
+            batch_gt_instances,
+            batch_img_metas,
+            batch_gt_instances_ignore=batch_gt_instances_ignore)
+        (anchor_list, labels_list, label_weights_list, bbox_targets_list,
+         assign_metrics_list, sampling_results_list) = cls_reg_targets
+
+        losses_cls, losses_bbox,\
+            cls_avg_factors, bbox_avg_factors = multi_apply(
+                self.loss_by_feat_single,
+                cls_scores,
+                decoded_bboxes,
+                labels_list,
+                label_weights_list,
+                bbox_targets_list,
+                assign_metrics_list,
+                self.prior_generator.strides)
+
+        cls_avg_factor = reduce_mean(sum(cls_avg_factors)).clamp_(min=1).item()
+        losses_cls = list(map(lambda x: x / cls_avg_factor, losses_cls))
+
+        bbox_avg_factor = reduce_mean(
+            sum(bbox_avg_factors)).clamp_(min=1).item()
+        losses_bbox = list(map(lambda x: x / bbox_avg_factor, losses_bbox))
+
+        loss_mask = self.loss_mask_by_feat(mask_feat, flatten_kernels,
+                                           sampling_results_list,
+                                           batch_gt_instances)
+        loss = dict(
+            loss_cls=losses_cls, loss_bbox=losses_bbox, loss_mask=loss_mask)
+        return loss

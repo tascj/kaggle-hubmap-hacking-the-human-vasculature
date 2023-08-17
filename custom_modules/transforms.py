@@ -13,6 +13,15 @@ from mmdet.structures.mask import BitmapMasks
 
 
 @TRANSFORMS.register_module()
+class ConvertGtMasks(BaseTransform):
+    def transform(self, results):
+        results['gt_masks'] = results['gt_masks'].to_tensor(
+            dtype=torch.bool, device='cpu'
+        )
+        return results
+
+
+@TRANSFORMS.register_module()
 class CropGtMasks(BaseTransform):
 
     def __init__(self, roi_size):
