@@ -31,7 +31,9 @@ model = dict(
         # to make it compatible with RTMDetSepBNHead pretrained weights
         exp_on_reg=True,
         # fix inaccurate downsampling
-        correct_downsample=True,
+        fix_downsample=True,
+        # fix reg_conv init
+        fix_reg_conv_init=True,
         num_classes=3,
         in_channels=320,
         stacked_convs=2,

@@ -1,11 +1,14 @@
 from typing import List, Optional, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from mmcv.cnn import ConvModule
 from mmdet.registry import MODELS
 from mmdet.models.dense_heads import RTMDetInsHead, RTMDetInsSepBNHead
+from mmdet.models.dense_heads.rtmdet_ins_head import MaskFeatModule
 from mmdet.models.layers.transformer import inverse_sigmoid
 from mmdet.models.utils import sigmoid_geometric_mean
 from mmdet.utils import InstanceList, reduce_mean
@@ -14,10 +17,10 @@ from mmdet.utils import InstanceList, reduce_mean
 
 @MODELS.register_module()
 class RTMDetInsHeadFixes(RTMDetInsHead):
-    def __init__(self, *args, exp_on_reg=False, correct_downsample=False, **kwargs):
+    def __init__(self, *args, exp_on_reg=False, fix_downsample=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.exp_on_reg = exp_on_reg
-        self.correct_downsample = correct_downsample
+        self.fix_downsample = fix_downsample
 
     def loss_mask_by_feat(self, mask_feats: Tensor, flatten_kernels: Tensor,
                           sampling_results_list: list,
@@ -63,7 +66,7 @@ class RTMDetInsHeadFixes(RTMDetInsHead):
             mode='bilinear',
             align_corners=False).squeeze(0)
         # downsample gt masks
-        if not self.correct_downsample:
+        if not self.fix_downsample:
             pos_gt_masks = pos_gt_masks[:, self.mask_loss_stride //
                                         2::self.mask_loss_stride,
                                         self.mask_loss_stride //
@@ -142,10 +145,130 @@ class RTMDetInsHeadFixes(RTMDetInsHead):
 
 @MODELS.register_module()
 class RTMDetInsSepBNHeadFixes(RTMDetInsSepBNHead):
-    def __init__(self, *args, exp_on_reg=False, correct_downsample=False, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self,
+                 *args,
+                 exp_on_reg=False,
+                 fix_downsample=False,
+                 fix_reg_conv_init=False,
+                 **kwargs):
         self.exp_on_reg = exp_on_reg
-        self.correct_downsample = correct_downsample
+        self.fix_downsample = fix_downsample
+        self.fix_reg_conv_init = fix_reg_conv_init
+        super().__init__(*args, **kwargs)
+
+    def _init_layers(self) -> None:
+        """Initialize layers of the head."""
+        self.cls_convs = nn.ModuleList()
+        self.reg_convs = nn.ModuleList()
+        self.kernel_convs = nn.ModuleList()
+
+        self.rtm_cls = nn.ModuleList()
+        self.rtm_reg = nn.ModuleList()
+        self.rtm_kernel = nn.ModuleList()
+        self.rtm_obj = nn.ModuleList()
+
+        # calculate num dynamic parameters
+        weight_nums, bias_nums = [], []
+        for i in range(self.num_dyconvs):
+            if i == 0:
+                weight_nums.append(
+                    (self.num_prototypes + 2) * self.dyconv_channels)
+                bias_nums.append(self.dyconv_channels)
+            elif i == self.num_dyconvs - 1:
+                weight_nums.append(self.dyconv_channels)
+                bias_nums.append(1)
+            else:
+                weight_nums.append(self.dyconv_channels * self.dyconv_channels)
+                bias_nums.append(self.dyconv_channels)
+        self.weight_nums = weight_nums
+        self.bias_nums = bias_nums
+        self.num_gen_params = sum(weight_nums) + sum(bias_nums)
+        pred_pad_size = self.pred_kernel_size // 2
+
+        for n in range(len(self.prior_generator.strides)):
+            cls_convs = nn.ModuleList()
+            reg_convs = nn.ModuleList()
+            kernel_convs = nn.ModuleList()
+            for i in range(self.stacked_convs):
+                chn = self.in_channels if i == 0 else self.feat_channels
+                cls_convs.append(
+                    ConvModule(
+                        chn,
+                        self.feat_channels,
+                        3,
+                        stride=1,
+                        padding=1,
+                        conv_cfg=self.conv_cfg,
+                        norm_cfg=self.norm_cfg,
+                        act_cfg=self.act_cfg))
+                reg_convs.append(
+                    ConvModule(
+                        chn,
+                        self.feat_channels,
+                        3,
+                        stride=1,
+                        padding=1,
+                        conv_cfg=self.conv_cfg,
+                        norm_cfg=self.norm_cfg,
+                        act_cfg=self.act_cfg))
+                kernel_convs.append(
+                    ConvModule(
+                        chn,
+                        self.feat_channels,
+                        3,
+                        stride=1,
+                        padding=1,
+                        conv_cfg=self.conv_cfg,
+                        norm_cfg=self.norm_cfg,
+                        act_cfg=self.act_cfg))
+            self.cls_convs.append(cls_convs)
+            if self.fix_reg_conv_init:
+                self.reg_convs.append(reg_convs)
+            else:
+                self.reg_convs.append(cls_convs)
+            self.kernel_convs.append(kernel_convs)
+
+            self.rtm_cls.append(
+                nn.Conv2d(
+                    self.feat_channels,
+                    self.num_base_priors * self.cls_out_channels,
+                    self.pred_kernel_size,
+                    padding=pred_pad_size))
+            self.rtm_reg.append(
+                nn.Conv2d(
+                    self.feat_channels,
+                    self.num_base_priors * 4,
+                    self.pred_kernel_size,
+                    padding=pred_pad_size))
+            self.rtm_kernel.append(
+                nn.Conv2d(
+                    self.feat_channels,
+                    self.num_gen_params,
+                    self.pred_kernel_size,
+                    padding=pred_pad_size))
+            if self.with_objectness:
+                self.rtm_obj.append(
+                    nn.Conv2d(
+                        self.feat_channels,
+                        1,
+                        self.pred_kernel_size,
+                        padding=pred_pad_size))
+
+        if self.share_conv:
+            for n in range(len(self.prior_generator.strides)):
+                for i in range(self.stacked_convs):
+                    self.cls_convs[n][i].conv = self.cls_convs[0][i].conv
+                    self.reg_convs[n][i].conv = self.reg_convs[0][i].conv
+
+        self.mask_head = MaskFeatModule(
+            in_channels=self.in_channels,
+            feat_channels=self.feat_channels,
+            stacked_convs=4,
+            num_levels=len(self.prior_generator.strides),
+            num_prototypes=self.num_prototypes,
+            act_cfg=self.act_cfg,
+            norm_cfg=self.norm_cfg)
+
 
     def loss_mask_by_feat(self, mask_feats: Tensor, flatten_kernels: Tensor,
                           sampling_results_list: list,
@@ -191,7 +314,7 @@ class RTMDetInsSepBNHeadFixes(RTMDetInsSepBNHead):
             mode='bilinear',
             align_corners=False).squeeze(0)
         # downsample gt masks
-        if not self.correct_downsample:
+        if not self.fix_downsample:
             pos_gt_masks = pos_gt_masks[:, self.mask_loss_stride //
                                         2::self.mask_loss_stride,
                                         self.mask_loss_stride //
